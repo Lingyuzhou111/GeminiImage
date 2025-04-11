@@ -185,7 +185,7 @@ class GeminiImage(Plugin):
             self.user_translate_settings = {}  # 用户ID -> 是否启用翻译
             
             # 初始化会话状态，用于保存上下文
-            self.conversations = {}  # 存储会话历史
+            self.conversations = defaultdict(list)  # 存储会话历史，默认初始化为空列表
             self.last_conversation_time = {}  # 记录每个会话的最后活动时间        
             self.conversation_session_types = {}  # 记录每个会话的类型
             self.conversation_expire_seconds = 180  # 会话过期时间(秒)，改为3分钟
