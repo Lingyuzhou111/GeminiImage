@@ -12,6 +12,10 @@
 
 > 在原版基础上增加识图和反推提示词功能，通过特定格式的指令触发，其中识图功能可以在3分钟内连续追问
 
+> 在原版基础上增加对话、切换对话模型、扩写提示词等功能，通过特定格式的指令触发
+
+> 在原版基础上增加多图融合功能，通过特定格式的指令触发
+
 ## 功能特点
 
 - 根据文本描述生成高质量图片
@@ -55,7 +59,7 @@
   "enable_proxy": false,                          # 是否启用HTTP代理
   "proxy_url": "",                                # HTTP代理服务器URL
   "use_proxy_service": true,                      # 是否启用Deno代理服务
-  "proxy_service_url": "",                        # Deno代理服务URL
+  "proxy_service_url": "your_deno_proxy_service_url",    # Deno代理服务URL
   "translate_api_base": "https://open.bigmodel.cn/api/paas/v4", # 翻译API基础URL
   "translate_api_key": "your_translate_api_key",  # 翻译API密钥
   "translate_model": "glm-4-flash",               # 翻译使用的模型
