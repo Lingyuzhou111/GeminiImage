@@ -312,7 +312,7 @@ class GeminiImage(Plugin):
                     prefix = "👉" if model == self.chat_model else ""
                     models_text += f"{prefix}{i}. {model}\n"
                 
-                models_text += "\n请输入命令和模型序号，例如：g切换对话模型 3"
+                models_text += "\n如需切换请输入命令和模型序号，例如：g切换模型 3"
                 reply = Reply(ReplyType.TEXT, models_text)
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
@@ -330,7 +330,7 @@ class GeminiImage(Plugin):
                         prefix = "👉" if model == self.chat_model else ""
                         models_text += f"{prefix}{i}. {model}\n"
                     
-                    models_text += "\n请输入命令和模型序号，例如：g切换对话模型 3"
+                    models_text += "\n如需切换请输入命令和模型序号，例如：g切换模型 3"
                     reply = Reply(ReplyType.TEXT, models_text)
                     e_context["reply"] = reply
                     e_context.action = EventAction.BREAK_PASS
@@ -629,7 +629,7 @@ class GeminiImage(Plugin):
                     del self.waiting_for_reference_image_time[user_id]
                 
                 # 发送成功获取图片的提示
-                success_reply = Reply(ReplyType.TEXT, "正在编辑图片，请稍候...")
+                success_reply = Reply(ReplyType.TEXT, "成功获取图片，正在处理中...")
                 e_context["reply"] = success_reply
                 e_context.action = EventAction.BREAK_PASS
                 e_context["channel"].send(success_reply, e_context["context"])
@@ -701,18 +701,8 @@ class GeminiImage(Plugin):
                     translated_prompt = self._translate_prompt(prompt, user_id)
                     
                     # 生成图片
-                    image_text_pairs, final_text, error = self._generate_image(prompt, conversation_history)
-                    
-                    if error:
-                        e_context["channel"].send(Reply(ReplyType.TEXT, error), e_context["context"])
-                        e_context.action = EventAction.BREAK_PASS
-                        return
-                    
-                    # 提取图片数据和文本响应
-                    image_datas = [pair[0] for pair in image_text_pairs if pair[0] is not None]
-                    text_responses = [pair[1] for pair in image_text_pairs if pair[1] is not None]
-                    if final_text:
-                        text_responses.append(final_text)
+                    image_datas, text_responses = self._generate_image(prompt, conversation_history)
+
                     
                     if image_datas:
                         # 在生成图片之前确保clean_texts有效
@@ -752,7 +742,7 @@ class GeminiImage(Plugin):
                                 {
                                     "role": "model", 
                                     "parts": [
-                                        {"text": text_response if text_response else "我已生成了图片"},
+                                        {"text": text_response if text_response else "图片生成成功！"},
                                         {"image_url": image_path}
                                     ]
                                 }
@@ -864,7 +854,7 @@ class GeminiImage(Plugin):
                     # 尝试编辑图片
                     try:
                         # 发送处理中消息
-                        processing_reply = Reply(ReplyType.TEXT, "正在编辑图片，请稍候...")
+                        processing_reply = Reply(ReplyType.TEXT, "成功获取图片，正在处理中...")
                         e_context["reply"] = processing_reply
                         
                         # 获取会话上下文
@@ -901,7 +891,7 @@ class GeminiImage(Plugin):
                             assistant_message = {
                                 "role": "model", 
                                 "parts": [
-                                    {"text": text_response if text_response else "我已编辑了图片"},
+                                    {"text": text_response if text_response else "图片编辑成功！"},
                                     {"image_url": image_path}
                                 ]
                             }
@@ -955,7 +945,7 @@ class GeminiImage(Plugin):
                         if last_image_path and os.path.exists(last_image_path):
                             try:
                                 # 发送处理中消息
-                                processing_reply = Reply(ReplyType.TEXT, "正在编辑图片，请稍候...")
+                                processing_reply = Reply(ReplyType.TEXT, "成功获取图片，正在处理中...")
                                 e_context["reply"] = processing_reply
                                 
                                 # 读取图片数据
@@ -994,7 +984,7 @@ class GeminiImage(Plugin):
                                     assistant_message = {
                                         "role": "model", 
                                         "parts": [
-                                            {"text": text_response if text_response else "我已编辑了图片"},
+                                            {"text": text_response if text_response else "图片编辑成功！"},
                                             {"image_url": image_path}
                                         ]
                                     }
@@ -1187,8 +1177,8 @@ class GeminiImage(Plugin):
                         if sender_id in self.waiting_for_reference_image_time:
                             del self.waiting_for_reference_image_time[sender_id]
                         
-                        # 直接发送正在编辑的提示（不再发送成功获取图片的提示）
-                        processing_reply = Reply(ReplyType.TEXT, "正在编辑图片，请稍候...")
+                        # 直接发送成功获取图片的提示
+                        processing_reply = Reply(ReplyType.TEXT, "成功获取图片，正在处理中...")
                         e_context["reply"] = processing_reply
                         e_context.action = EventAction.BREAK_PASS
                         e_context["channel"].send(processing_reply, e_context["context"])
@@ -1387,22 +1377,27 @@ class GeminiImage(Plugin):
             # 记录last_images中与当前会话键相关的图片路径
             if conversation_key in self.last_images:
                 last_image_path = self.last_images[conversation_key]
-                logger.info(f"会话 {conversation_key} 的最后一张图片路径: {last_image_path}, 文件存在: {os.path.exists(last_image_path)}")
+                # 确保last_image_path是字符串类型
+                if isinstance(last_image_path, list):
+                    last_image_path = last_image_path[0] if last_image_path else None
                 
-                # 如果last_images中有图片但image_cache中没有，尝试从文件读取并加入缓存
-                if os.path.exists(last_image_path):
-                    try:
-                        with open(last_image_path, "rb") as f:
-                            image_data = f.read()
-                            # 加入缓存
-                            self.image_cache[conversation_key] = {
-                                "content": image_data,
-                                "timestamp": time.time()
-                            }
-                            logger.info(f"从最后图片路径读取并加入缓存: {last_image_path}")
-                            return image_data
-                    except Exception as e:
-                        logger.error(f"从文件读取图片失败: {e}")
+                if last_image_path:
+                    logger.info(f"会话 {conversation_key} 的最后一张图片路径: {last_image_path}, 文件存在: {os.path.exists(last_image_path)}")
+                    
+                    # 如果last_images中有图片但image_cache中没有，尝试从文件读取并加入缓存
+                    if os.path.exists(last_image_path):
+                        try:
+                            with open(last_image_path, "rb") as f:
+                                image_data = f.read()
+                                # 加入缓存
+                                self.image_cache[conversation_key] = {
+                                    "content": image_data,
+                                    "timestamp": time.time()
+                                }
+                                logger.info(f"从最后图片路径读取并加入缓存: {last_image_path}")
+                                return image_data
+                        except Exception as e:
+                            logger.error(f"从文件读取图片失败: {e}")
         else:
             logger.info("last_images为空")
             
@@ -1703,19 +1698,9 @@ class GeminiImage(Plugin):
             logger.exception(e)
             return None
 
-    def _generate_image(self, prompt: str, conversation_history: List[Dict] = None) -> Tuple[List[Tuple[Optional[bytes], Optional[str]]], Optional[str], Optional[str]]:
-        """调用Gemini API生成图片，返回图文对列表、最终文本和错误信息
-        
-        Args:
-            prompt: 提示词
-            conversation_history: 会话历史
-            
-        Returns:
-            Tuple[List[Tuple[Optional[bytes], Optional[str]]], Optional[str], Optional[str]]:
-            - 图文对列表：每个元素是(图片数据, 对应文本)的元组
-            - 最终文本：API返回的最终总结文本
-            - 错误信息：如果发生错误，返回错误描述
-        """
+    def _generate_image(self, prompt: str, conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
+        """调用Gemini API生成图片，返回图片数据和文本响应"""
+
         # 根据配置决定使用直接调用还是通过代理服务调用
         if self.use_proxy_service and self.proxy_service_url:
             # 使用代理服务调用API
@@ -1851,16 +1836,14 @@ class GeminiImage(Plugin):
                     parts = content.get("parts", [])
                     
                     # 处理文本和图片响应，以列表形式返回所有部分
-                    image_text_pairs = []
-                    final_text = None
+                    text_responses = []
+                    image_datas = []
                     
                     for part in parts:
                         # 处理文本部分
                         if "text" in part and part["text"]:
-                            text = part["text"]
-                            # 如果是最后一个文本部分，作为final_text
-                            final_text = text
-                            image_text_pairs.append((None, text))
+                            text_responses.append(part["text"])
+                            image_datas.append(None)  # 对应位置添加None表示没有图片
                         
                         # 处理图片部分
                         elif "inlineData" in part:
@@ -1868,13 +1851,18 @@ class GeminiImage(Plugin):
                             if inline_data and "data" in inline_data:
                                 # Base64解码图片数据
                                 img_data = base64.b64decode(inline_data["data"])
-                                image_text_pairs.append((img_data, None))
+                                image_datas.append(img_data)
+                                text_responses.append(None)  # 对应位置添加None表示没有文本
                     
-                    if not image_text_pairs:
-                        logger.error(f"API响应中没有找到有效内容: {result}")
-                        return [], final_text, "API响应中没有找到有效内容"
+                    if not image_datas or all(img is None for img in image_datas):
+                        logger.error(f"API响应中没有找到图片数据: {result}")
+                        # 检查是否有文本响应，仅返回文本数据
+                        if text_responses and any(text is not None for text in text_responses):
+                            # 仅返回文本响应，不修改e_context
+                            return [], text_responses  # 返回空图片列表和文本
+                        return [], []
                     
-                    return image_text_pairs, final_text, None
+                    return image_datas, text_responses
                 
                 logger.error(f"未找到生成的内容: {result}")
                 return [], None, "未找到生成的内容"
@@ -2803,7 +2791,7 @@ class GeminiImage(Plugin):
                 
                 # 添加助手回复到会话
                 self._add_message_to_conversation(conversation_key, "model", [
-                    {"text": text_response if text_response else "我已编辑了参考图片"},
+                    {"text": text_response if text_response else "参考图片编辑成功！"},
                     {"image_url": image_path}
                 ])
                 
@@ -2887,7 +2875,7 @@ class GeminiImage(Plugin):
             
             help_text += "\n注意事项：\n"
             help_text += "* 图片生成可能需要一些时间，请耐心等待\n"
-            help_text += "* 会话有效期为10分钟，超时后需要重新开始\n"
+            help_text += "* 会话有效期为3分钟，超时后需要重新开始\n"
             help_text += "* 不支持生成违反内容政策的图片\n"
             help_text += "* 识图和追问功能的等待时间为3分钟\n"
             help_text += "* 追问功能仅在最近一次识图后的3分钟内有效\n"
