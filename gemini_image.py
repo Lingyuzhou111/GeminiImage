@@ -1101,7 +1101,7 @@ class GeminiImage(Plugin):
                 logger.info(f"用户 {user_id} 开始等待上传融图的第一张图片，提示词: {prompt}")
                 
                 # 发送提示消息
-                reply = Reply(ReplyType.TEXT, "请发送融图的第一张图片")
+                reply = Reply(ReplyType.TEXT, "请发送需要gemini融图的第一张图片")
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
                 return
@@ -2897,7 +2897,7 @@ class GeminiImage(Plugin):
         
         try:
             # 发送唯一的处理中消息
-            processing_reply = Reply(ReplyType.TEXT, "正在融合图片...")
+            processing_reply = Reply(ReplyType.TEXT, "成功获取第二张图片，正在融合中...")
             channel.send(processing_reply, context)
             
             # 确保会话存在并设置为融图模式
