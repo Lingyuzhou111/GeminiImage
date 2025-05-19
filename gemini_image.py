@@ -106,6 +106,12 @@ class GeminiImage(Plugin):
         try:
             super().__init__()
             
+            # 提高urllib3和requests的日志级别，以避免在DEBUG模式下打印过多请求/响应体
+            # 这有助于防止base64数据刷屏
+            logging.getLogger("urllib3").setLevel(logging.WARNING)
+            logging.getLogger("requests").setLevel(logging.WARNING)
+            logger.debug(f"INIT - urllib3 effective level: {logging.getLogger('urllib3').getEffectiveLevel()}, requests effective level: {logging.getLogger('requests').getEffectiveLevel()}")
+
             # 载入配置
             self.config = super().load_config() or self._load_config_template()
             
@@ -120,6 +126,7 @@ class GeminiImage(Plugin):
             
             # 模型配置
             self.image_model = self.config.get("image_model", "gemini-2.0-flash-exp-image-generation")
+            self.analysis_model = self.config.get("analysis_model", "gemini-2.5-flash-preview-04-17")
             self.chat_model = self.config.get("chat_model", "gemini-2.0-flash-thinking-exp-01-21")
             # 可用模型列表
             self.chat_model_list = self.config.get("chat_model_list", [
@@ -239,6 +246,40 @@ class GeminiImage(Plugin):
             logger.exception(e)
             self.enable = False
 
+    def _verify_image_integrity(self, image_data: Optional[bytes], operation_name: str, image_identifier: str = "input_image") -> bool:
+        """
+        Verifies the integrity of image data using Pillow.
+
+        Args:
+            image_data: Image data in bytes.
+            operation_name: Name of the operation (e.g., "识图", "融图-第一张") for logging.
+            image_identifier: A string to identify the image in logs (e.g., "input_image", "first_merge_image").
+
+        Returns:
+            True if the image is valid, False otherwise.
+        """
+        if not image_data or len(image_data) < 100: # Basic check for empty or too small data (increased threshold slightly)
+            logger.error(f"Image integrity check FAILED for {operation_name} ({image_identifier}): Image data is None, empty, or too small (size: {len(image_data) if image_data else 0} bytes).")
+            return False
+        try:
+            # First open and verify (lightweight check)
+            img_verify_stream = BytesIO(image_data)
+            img_verify = Image.open(img_verify_stream)
+            img_verify.verify()
+            
+            # Re-open from a fresh stream and load to fully parse and catch more errors
+            # verify() can make the stream unusable for some formats.
+            img_load_stream = BytesIO(image_data) # Use a new BytesIO object
+            img_load = Image.open(img_load_stream)
+            img_load.load() 
+            
+            logger.info(f"Image integrity check PASSED for {operation_name} ({image_identifier}). Format: {img_load.format}, Mode: {img_load.mode}, Size: {img_load.size}, Data size: {len(image_data)} bytes.")
+            return True
+        except Exception as e:
+            logger.error(f"Image integrity check FAILED for {operation_name} ({image_identifier}). Error: {type(e).__name__} - {str(e)}. Data size: {len(image_data)} bytes.")
+            # For detailed debugging, one might log: logger.error(traceback.format_exc())
+            return False
+
     def on_handle_context(self, e_context: EventContext):
         """处理消息事件"""
         if not self.enable:
@@ -302,7 +343,159 @@ class GeminiImage(Plugin):
             return
         
         content = context.content.strip()
-        
+        # --- BEGIN: New logic for handling referenced images ---
+        if msg: # Ensure msg object exists
+            is_ref_image_case = hasattr(msg, 'is_processed_image_quote') and \
+                                msg.is_processed_image_quote and \
+                                hasattr(msg, 'referenced_image_path') and \
+                                msg.referenced_image_path
+            
+            if is_ref_image_case:
+                referenced_image_path = msg.referenced_image_path
+                
+                # Check for "g识图" (image_analysis_commands)
+                for analysis_cmd in self.image_analysis_commands:
+                    if content.startswith(analysis_cmd):
+                        question = content[len(analysis_cmd):].strip()
+                        # 如果剥离命令后没有问题，则使用默认识图提示或者一个通用提示
+                        if not question:
+                            # GeminiImage 的 _analyze_image 内部会处理 question 为空的情况，使用默认分析prompt
+                            # 或者可以显式设置一个，例如:
+                            # question = "请详细分析这张图片。"
+                            pass # _analyze_image handles empty question
+
+                        logger.info(f"[{self.name}] Referenced image analysis: User '{user_id}', Command '{analysis_cmd}', Question '{question}', ImagePath '{referenced_image_path}'")
+                        
+                        image_data = self._get_image_data(msg, referenced_image_path) # Pass msg for consistency if _get_image_data uses it
+                        
+                        if image_data:
+                            if not self._verify_image_integrity(image_data, "引用识图", referenced_image_path):
+                                reply = Reply(ReplyType.TEXT, "引用的图片文件似乎已损坏或格式不受支持。")
+                                e_context["reply"] = reply
+                                e_context.action = EventAction.BREAK_PASS
+                                return
+
+                            try:
+                                # 发送处理中消息 (可选，但推荐)
+                                processing_reply = Reply(ReplyType.INFO, "Gemini正在分析引用的图片...")
+                                e_context["channel"].send(processing_reply, context)
+
+                                analysis_result = self._analyze_image(image_data, question)
+                                if analysis_result:
+                                    # 更新追问相关的状态 (如果需要，GeminiImage 已有此逻辑)
+                                    self.last_analysis_image[user_id] = image_data
+                                    self.last_analysis_time[user_id] = time.time()
+                                    analysis_result += "\n💬3min内输入g追问+问题，可继续追问" # 与现有逻辑保持一致
+                                    reply = Reply(ReplyType.TEXT, analysis_result)
+                                else:
+                                    reply = Reply(ReplyType.TEXT, "图片分析失败，请稍后重试。")
+                            except Exception as e:
+                                logger.error(f"[{self.name}] Error processing referenced image analysis: {e}", exc_info=True)
+                                reply = Reply(ReplyType.ERROR, f"分析引用图片时出错: {str(e)}")
+                            
+                            e_context["reply"] = reply
+                            e_context.action = EventAction.BREAK_PASS
+                            return # Important: End processing here
+                        else:
+                            logger.error(f"[{self.name}] Failed to get image data for referenced image: {referenced_image_path}")
+                            reply = Reply(ReplyType.ERROR, "无法获取引用的图片数据。")
+                            e_context["reply"] = reply
+                            e_context.action = EventAction.BREAK_PASS
+                            return # Important: End processing here
+
+                # Check for "g反推" (image_reverse_commands)
+                for reverse_cmd in self.image_reverse_commands:
+                    if content == reverse_cmd: # "g反推" 通常不带额外参数
+                        logger.info(f"[{self.name}] Referenced image reverse: User '{user_id}', Command '{reverse_cmd}', ImagePath '{referenced_image_path}'")
+                        
+                        image_data = self._get_image_data(msg, referenced_image_path)
+                        
+                        if image_data:
+                            if not self._verify_image_integrity(image_data, "引用反推", referenced_image_path):
+                                reply = Reply(ReplyType.TEXT, "引用的图片文件似乎已损坏或格式不受支持。")
+                                e_context["reply"] = reply
+                                e_context.action = EventAction.BREAK_PASS
+                                return
+
+                            try:
+                                # 发送处理中消息 (可选)
+                                processing_reply = Reply(ReplyType.INFO, "Gemini正在反推引用的图片...")
+                                e_context["channel"].send(processing_reply, context)
+
+                                reverse_result = self._reverse_image(image_data) # _reverse_image 内部有默认prompt
+                                if reverse_result:
+                                    reply = Reply(ReplyType.TEXT, reverse_result)
+                                else:
+                                    reply = Reply(ReplyType.TEXT, "图片反推失败，请稍后重试。")
+                            except Exception as e:
+                                logger.error(f"[{self.name}] Error processing referenced image reverse: {e}", exc_info=True)
+                                reply = Reply(ReplyType.ERROR, f"反推引用图片时出错: {str(e)}")
+                            
+                            e_context["reply"] = reply
+                            e_context.action = EventAction.BREAK_PASS
+                            return # Important: End processing here
+                        else:
+                            logger.error(f"[{self.name}] Failed to get image data for referenced image: {referenced_image_path}")
+                            reply = Reply(ReplyType.ERROR, "无法获取引用的图片数据。")
+                            e_context["reply"] = reply
+                            e_context.action = EventAction.BREAK_PASS
+                            return # Important: End processing here
+
+                # Check for "g参考图" (reference_image_commands) - NEW BLOCK
+                # Assuming self.reference_image_commands is defined in __init__, e.g.,
+                # self.reference_image_commands = self.config.get("reference_image_commands", ["g参考图", "G参考图"])
+                for ref_cmd in getattr(self, 'reference_image_commands', ["g参考图", "G参考图"]): # Default if not defined
+                    if content.startswith(ref_cmd):
+                        prompt_for_ref_edit = content[len(ref_cmd):].strip()
+                        if not prompt_for_ref_edit:
+                            reply = Reply(ReplyType.TEXT, f'请在"{ref_cmd}"后输入您的编辑指令。')
+                            e_context["reply"] = reply
+                            e_context.action = EventAction.BREAK_PASS
+                            return
+
+                        logger.info(f"[{self.name}] Referenced image edit: User '{user_id}', Command '{ref_cmd}', Prompt '{prompt_for_ref_edit}', ImagePath '{referenced_image_path}'")
+                        
+                        image_data_bytes = self._get_image_data(msg, referenced_image_path)
+                        
+                        if image_data_bytes:
+                            if not self._verify_image_integrity(image_data_bytes, f"引用{ref_cmd}", referenced_image_path):
+                                reply = Reply(ReplyType.TEXT, "引用的图片文件似乎已损坏或格式不受支持。")
+                                e_context["reply"] = reply
+                                e_context.action = EventAction.BREAK_PASS
+                                return
+
+                            try:
+                                # Ensure base64 is imported at the top of the file.
+                                # If not, this line will cause an error.
+                                # Consider adding 'import base64' if it's missing from the file's imports.
+                                image_base64_str = base64.b64encode(image_data_bytes).decode('utf-8')
+
+                                processing_reply = Reply(ReplyType.INFO, f'Gemini正在对引用的图片进行编辑...')
+                                e_context["channel"].send(processing_reply, context)
+
+                                # _handle_reference_image_edit is expected to handle API calls,
+                                # errors, and setting the final reply on e_context.
+                                self._handle_reference_image_edit(e_context, user_id, prompt_for_ref_edit, image_base64_str)
+                            
+                            except ImportError:
+                                logger.critical(f"[{self.name}] CRITICAL ERROR: base64 module not imported. Cannot process referenced image edit for '{ref_cmd}'.")
+                                reply = Reply(ReplyType.ERROR, f'处理"{ref_cmd}"时发生严重内部错误 (base64 import missing)。请联系管理员。')
+                                e_context["reply"] = reply
+                                e_context.action = EventAction.BREAK_PASS
+                            except Exception as e_ref_edit:
+                                logger.error(f"[{self.name}] Error processing referenced image edit with '{ref_cmd}': {e_ref_edit}", exc_info=True)
+                                reply = Reply(ReplyType.ERROR, f'使用引用图片进行"{ref_cmd}"编辑时出错: {str(e_ref_edit)}')
+                                e_context["reply"] = reply
+                                e_context.action = EventAction.BREAK_PASS
+                            
+                            return # Important: End processing here for this command
+                        else:
+                            logger.error(f"[{self.name}] Failed to get image data for referenced image (for '{ref_cmd}'): {referenced_image_path}")
+                            reply = Reply(ReplyType.ERROR, "无法获取引用的图片数据以进行编辑。")
+                            e_context["reply"] = reply
+                            e_context.action = EventAction.BREAK_PASS
+                            return # Important: End processing here
+        # --- END: New logic for handling referenced images ---        
         # 检查是否是打印模型命令
         for cmd in self.print_model_commands:
             if content == cmd:
@@ -858,8 +1051,20 @@ class GeminiImage(Plugin):
                         e_context["reply"] = processing_reply
                         
                         # 获取会话上下文
-                        conversation_history = self.conversations[conversation_key]
-                        
+                        # conversation_history = self.conversations[conversation_key]
+                        current_conversation_entry = self.conversations.get(conversation_key)
+                        if isinstance(current_conversation_entry, dict) and "messages" in current_conversation_entry and isinstance(current_conversation_entry["messages"], list):
+                            conversation_history = current_conversation_entry["messages"]
+                        elif isinstance(current_conversation_entry, list): # Handle case where it might be directly a list from defaultdict
+                            logger.warning(f"Conversation {conversation_key} was a direct list, wrapping into dict structure.")
+                            self.conversations[conversation_key] = {"messages": current_conversation_entry, "conversation_id": ""}
+                            conversation_history = current_conversation_entry
+                        else:
+                            logger.warning(f"Conversation {conversation_key} data is not in expected dict format or messages list is missing. Re-initializing. Data: {current_conversation_entry}")
+                            self.conversations[conversation_key] = {"messages": [], "conversation_id": ""}
+                            conversation_history = self.conversations[conversation_key]["messages"]
+
+
                         # 翻译提示词
                         translated_prompt = self._translate_prompt(prompt, user_id)
                         
@@ -953,8 +1158,19 @@ class GeminiImage(Plugin):
                                     image_data = f.read()
                                 
                                 # 获取会话上下文
-                                conversation_history = self.conversations[conversation_key]
-                                
+                                # conversation_history = self.conversations[conversation_key]
+                                current_conversation_entry_alt = self.conversations.get(conversation_key)
+                                if isinstance(current_conversation_entry_alt, dict) and "messages" in current_conversation_entry_alt and isinstance(current_conversation_entry_alt["messages"], list):
+                                    conversation_history = current_conversation_entry_alt["messages"]
+                                elif isinstance(current_conversation_entry_alt, list):
+                                    logger.warning(f"Conversation {conversation_key} (alt path) was a direct list, wrapping into dict structure.")
+                                    self.conversations[conversation_key] = {"messages": current_conversation_entry_alt, "conversation_id": ""}
+                                    conversation_history = current_conversation_entry_alt
+                                else:
+                                    logger.warning(f"Conversation {conversation_key} (alt path) data is not in expected dict format or messages list is missing. Re-initializing. Data: {current_conversation_entry_alt}")
+                                    self.conversations[conversation_key] = {"messages": [], "conversation_id": ""}
+                                    conversation_history = self.conversations[conversation_key]["messages"]
+
                                 # 翻译提示词
                                 translated_prompt = self._translate_prompt(prompt, user_id)
                                 
@@ -1112,238 +1328,250 @@ class GeminiImage(Plugin):
         session_id = context.get("session_id")
         is_group = context.get("isgroup", False)
         
-        # 获取图片内容路径
-        image_path = context.content
-        logger.info(f"收到图片消息，路径: {image_path}")
+        # 获取图片内容路径 (可能为XML或实际文件路径)
+        image_path_or_xml_content = context.content
+        logger.info(f"收到图片消息，原始content: {str(image_path_or_xml_content)[:200]}...")
         
         # 获取发送者ID，确保群聊和单聊场景都能正确缓存
         sender_id = context.get("from_user_id")  # 默认使用from_user_id
         
+        msg_obj = None # Initialize msg_obj
         if 'msg' in context.kwargs:
-            msg = context.kwargs['msg']
+            msg_obj = context.kwargs['msg']
             
             # 在群聊中，优先使用actual_user_id作为用户标识
-            if is_group and hasattr(msg, 'actual_user_id') and msg.actual_user_id:
-                sender_id = msg.actual_user_id
+            if is_group and hasattr(msg_obj, 'actual_user_id') and msg_obj.actual_user_id:
+                sender_id = msg_obj.actual_user_id
                 logger.info(f"群聊中使用actual_user_id作为发送者ID: {sender_id}")
             elif not is_group:
                 # 私聊中使用from_user_id或session_id
-                if hasattr(msg, 'from_user_id') and msg.from_user_id:
-                    sender_id = msg.from_user_id
+                if hasattr(msg_obj, 'from_user_id') and msg_obj.from_user_id:
+                    sender_id = msg_obj.from_user_id
                     logger.info(f"私聊中使用from_user_id作为发送者ID: {sender_id}")
                 else:
-                    sender_id = session_id
+                    sender_id = session_id # Fallback to session_id if from_user_id is not specific
                     logger.info(f"私聊中使用session_id作为发送者ID: {sender_id}")
             
-            # 使用统一的图片获取方法获取图片数据
-            logger.info(f"开始获取图片数据，图片路径: {image_path}, 发送者ID: {sender_id}")
-            image_data = self._get_image_data(msg, image_path)
-            
-            # 如果获取到图片数据，进行处理
-            if image_data and len(image_data) > 1000:  # 确保数据大小合理
-                try:
-                    # 验证是否为有效的图片数据
-                    Image.open(BytesIO(image_data))
-                    
-                    # 保存图片到缓存 - 使用多个键增加找到图片的机会
-                    self.image_cache[session_id] = {
+        # 使用统一的图片获取方法获取图片数据
+        # msg_obj is passed for potential future use or if other parts of _get_image_data (not removed) might need it.
+        # For current simplification, _get_image_data will primarily use image_path_or_xml_content.
+        logger.info(f"开始尝试从content获取图片数据 (sender_id: {sender_id})")
+        image_data = self._get_image_data(msg_obj, image_path_or_xml_content) 
+        
+        # 如果获取到图片数据，进行处理
+        if image_data and len(image_data) > 1000:  # 确保数据大小合理 (e.g. > 1KB)
+            try:
+                # 验证是否为有效的图片数据
+                Image.open(BytesIO(image_data))
+                
+                # 保存图片到缓存 - 使用多个键增加找到图片的机会
+                self.image_cache[session_id] = {
+                    "content": image_data,
+                    "timestamp": time.time()
+                }
+                
+                # 如果sender_id存在且与session_id不同，也用sender_id缓存
+                if sender_id and sender_id != session_id:
+                    self.image_cache[sender_id] = {
                         "content": image_data,
                         "timestamp": time.time()
                     }
+                
+                # 修复日志记录格式    
+                log_message = f"成功缓存图片数据，大小: {len(image_data)} 字节，缓存键: {session_id}"
+                if sender_id and sender_id != session_id:
+                    log_message += f", {sender_id}"
+                logger.info(log_message)
+                
+                # 检查是否有用户在等待上传参考图片
+                if sender_id and sender_id in self.waiting_for_reference_image:
+                    prompt = self.waiting_for_reference_image[sender_id]
+                    logger.info(f"检测到用户 {sender_id} 正在等待上传参考图片，提示词: {prompt}")
                     
-                    # 如果sender_id存在且与session_id不同，也用sender_id缓存
-                    if sender_id and sender_id != session_id:
-                        self.image_cache[sender_id] = {
-                            "content": image_data,
-                            "timestamp": time.time()
-                        }
+                    # 将图片转换为base64
+                    image_base64 = base64.b64encode(image_data).decode('utf-8')
                     
-                    # 修复日志记录格式    
-                    log_message = f"成功缓存图片数据，大小: {len(image_data)} 字节，缓存键: {session_id}"
-                    if sender_id and sender_id != session_id:
-                        log_message += f", {sender_id}"
-                    logger.info(log_message)
+                    # 清除等待状态
+                    del self.waiting_for_reference_image[sender_id]
+                    if sender_id in self.waiting_for_reference_image_time:
+                        del self.waiting_for_reference_image_time[sender_id]
                     
-                    # 检查是否有用户在等待上传参考图片
-                    if sender_id and sender_id in self.waiting_for_reference_image:
-                        prompt = self.waiting_for_reference_image[sender_id]
-                        logger.info(f"检测到用户 {sender_id} 正在等待上传参考图片，提示词: {prompt}")
+                    # 直接发送成功获取图片的提示
+                    processing_reply = Reply(ReplyType.TEXT, "成功获取图片，正在处理中...")
+                    e_context["reply"] = processing_reply
+                    e_context.action = EventAction.BREAK_PASS
+                    e_context["channel"].send(processing_reply, e_context["context"])
+                    
+                    # 处理参考图片编辑
+                    self._handle_reference_image_edit(e_context, sender_id, prompt, image_base64)
+                    return
+                # 检查是否有用户在等待反推提示词
+                elif sender_id and sender_id in self.waiting_for_reverse_image:
+                    # 检查是否超时
+                    if time.time() - self.waiting_for_reverse_image_time[sender_id] > self.reverse_image_wait_timeout:
+                        # 清理状态
+                        del self.waiting_for_reverse_image[sender_id]
+                        del self.waiting_for_reverse_image_time[sender_id]
                         
-                        # 将图片转换为base64
-                        image_base64 = base64.b64encode(image_data).decode('utf-8')
-                        
-                        # 清除等待状态
-                        del self.waiting_for_reference_image[sender_id]
-                        if sender_id in self.waiting_for_reference_image_time:
-                            del self.waiting_for_reference_image_time[sender_id]
-                        
-                        # 直接发送成功获取图片的提示
-                        processing_reply = Reply(ReplyType.TEXT, "成功获取图片，正在处理中...")
-                        e_context["reply"] = processing_reply
+                        reply = Reply(ReplyType.TEXT, "图片上传超时，请重新发送反推提示词命令")
+                        e_context["reply"] = reply
                         e_context.action = EventAction.BREAK_PASS
-                        e_context["channel"].send(processing_reply, e_context["context"])
-                        
-                        # 处理参考图片编辑
-                        self._handle_reference_image_edit(e_context, sender_id, prompt, image_base64)
                         return
-                    # 检查是否有用户在等待反推提示词
-                    elif sender_id and sender_id in self.waiting_for_reverse_image:
-                        # 检查是否超时
-                        if time.time() - self.waiting_for_reverse_image_time[sender_id] > self.reverse_image_wait_timeout:
-                            # 清理状态
-                            del self.waiting_for_reverse_image[sender_id]
-                            del self.waiting_for_reverse_image_time[sender_id]
-                            
-                            reply = Reply(ReplyType.TEXT, "图片上传超时，请重新发送反推提示词命令")
-                            e_context["reply"] = reply
-                            e_context.action = EventAction.BREAK_PASS
-                            return
-                        
-                        try:
-                            # 调用API分析图片
-                            logger.info(f"开始反推提示词，图片大小: {len(image_data)} 字节")
-                            reverse_result = self._reverse_image(image_data)
-                            if reverse_result:
-                                logger.info(f"反推提示词成功，结果长度: {len(reverse_result)}")
+                    
+                    try:
+                        # 调用API分析图片
+                        logger.info(f"开始反推提示词，图片大小: {len(image_data)} 字节")
+                        reverse_result = self._reverse_image(image_data)
+                        if reverse_result:
+                            if reverse_result == "图片文件似乎已损坏或格式不受支持，无法进行反推。":
+                                # 这是来自完整性检查的错误
                                 reply = Reply(ReplyType.TEXT, reverse_result)
                             else:
-                                logger.error("反推提示词失败，API返回为空")
-                                reply = Reply(ReplyType.TEXT, "图片分析失败，请稍后重试")
-                            
-                            # 清理状态
-                            del self.waiting_for_reverse_image[sender_id]
-                            del self.waiting_for_reverse_image_time[sender_id]
-                            
-                            e_context["reply"] = reply
-                            e_context.action = EventAction.BREAK_PASS
-                            return
-                        except Exception as e:
-                            logger.error(f"处理反推请求异常: {str(e)}")
-                            logger.exception(e)
-                            
-                            # 清理状态
-                            del self.waiting_for_reverse_image[sender_id]
-                            del self.waiting_for_reverse_image_time[sender_id]
-                            
-                            reply = Reply(ReplyType.TEXT, f"图片分析失败: {str(e)}")
-                            e_context["reply"] = reply
-                            e_context.action = EventAction.BREAK_PASS
-                            return
-                    # 检查是否有用户在等待识图
-                    elif sender_id and sender_id in self.waiting_for_analysis_image:
-                        # 检查是否超时
-                        if time.time() - self.waiting_for_analysis_image_time[sender_id] > self.analysis_image_wait_timeout:
-                            # 清理状态
-                            del self.waiting_for_analysis_image[sender_id]
-                            del self.waiting_for_analysis_image_time[sender_id]
-                            
-                            reply = Reply(ReplyType.TEXT, "图片上传超时，请重新发送识图命令")
-                            e_context["reply"] = reply
-                            e_context.action = EventAction.BREAK_PASS
-                            return
+                                # 这是成功的API响应
+                                logger.info(f"反推提示词成功，结果长度: {len(reverse_result)}")
+                                reply = Reply(ReplyType.TEXT, reverse_result)
+                        else:
+                            # API调用本身返回None
+                            logger.error("反推提示词失败，_reverse_image返回为空 (可能为API调用问题或未预料的内部错误)")
+                            reply = Reply(ReplyType.TEXT, "图片分析失败，请稍后重试")
                         
-                        try:
-                            # 获取用户的问题或默认提示词
-                            question = self.waiting_for_analysis_image[sender_id]
-                            logger.info(f"开始识图，问题: {question}, 图片大小: {len(image_data)} 字节")
-                            
-                            # 调用API分析图片
-                            analysis_result = self._analyze_image(image_data, question)
-                            if analysis_result:
-                                logger.info(f"识图成功，结果长度: {len(analysis_result)}")
-                                # 缓存图片数据和时间戳，用于后续追问
-                                self.last_analysis_image[sender_id] = image_data
-                                self.last_analysis_time[sender_id] = time.time()
-                                
-                                # 添加追问提示
-                                analysis_result += "\n💬3min内输入g追问+问题，可继续追问"
+                        # 清理状态
+                        del self.waiting_for_reverse_image[sender_id]
+                        del self.waiting_for_reverse_image_time[sender_id]
+                        
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                    except Exception as e:
+                        logger.error(f"处理反推请求异常: {str(e)}")
+                        logger.exception(e)
+                        
+                        # 清理状态
+                        del self.waiting_for_reverse_image[sender_id]
+                        del self.waiting_for_reverse_image_time[sender_id]
+                        
+                        reply = Reply(ReplyType.TEXT, f"图片分析失败: {str(e)}")
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                # 检查是否有用户在等待识图
+                elif sender_id and sender_id in self.waiting_for_analysis_image:
+                    # 检查是否超时
+                    if time.time() - self.waiting_for_analysis_image_time[sender_id] > self.analysis_image_wait_timeout:
+                        # 清理状态
+                        del self.waiting_for_analysis_image[sender_id]
+                        del self.waiting_for_analysis_image_time[sender_id]
+                        
+                        reply = Reply(ReplyType.TEXT, "图片上传超时，请重新发送识图命令")
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                    
+                    try:
+                        # 获取用户的问题或默认提示词
+                        question = self.waiting_for_analysis_image[sender_id]
+                        logger.info(f"开始识图，问题: {question}, 图片大小: {len(image_data)} 字节")
+                        
+                        # 调用API分析图片
+                        analysis_result = self._analyze_image(image_data, question)
+                        if analysis_result:
+                            if analysis_result == "图片文件似乎已损坏或格式不受支持，无法进行分析。":
+                                # 这是来自完整性检查的错误
                                 reply = Reply(ReplyType.TEXT, analysis_result)
                             else:
-                                logger.error("识图失败，API返回为空")
-                                reply = Reply(ReplyType.TEXT, "图片分析失败，请稍后重试")
-                            
-                            # 清理状态
-                            del self.waiting_for_analysis_image[sender_id]
-                            del self.waiting_for_analysis_image_time[sender_id]
-                            
-                            e_context["reply"] = reply
-                            e_context.action = EventAction.BREAK_PASS
-                            return
-                        except Exception as e:
-                            logger.error(f"处理识图请求异常: {str(e)}")
-                            logger.exception(e)
-                            
-                            # 清理状态
-                            del self.waiting_for_analysis_image[sender_id]
-                            del self.waiting_for_analysis_image_time[sender_id]
-                            
-                            reply = Reply(ReplyType.TEXT, f"图片分析失败: {str(e)}")
-                            e_context["reply"] = reply
-                            e_context.action = EventAction.BREAK_PASS
-                            return
-                    # 检查是否有用户在等待上传融图图片
-                    elif sender_id and sender_id in self.waiting_for_merge_image:
-                        # 检查是否超时
-                        if time.time() - self.waiting_for_merge_image_time[sender_id] > self.merge_image_wait_timeout:
-                            # 清理状态
-                            del self.waiting_for_merge_image[sender_id]
-                            del self.waiting_for_merge_image_time[sender_id]
-                            if sender_id in self.merge_first_image:
-                                del self.merge_first_image[sender_id]
-                            
-                            reply = Reply(ReplyType.TEXT, "图片上传超时，请重新发送融图命令")
-                            e_context["reply"] = reply
-                            e_context.action = EventAction.BREAK_PASS
-                            return
-                        
-                        # 将图片转换为base64
-                        image_base64 = base64.b64encode(image_data).decode('utf-8')
-                        
-                        # 检查是否是第一张图片
-                        if sender_id not in self.merge_first_image:
-                            # 保存第一张图片
-                            self.merge_first_image[sender_id] = image_base64
-                            logger.info(f"接收到融图第一张图片，用户ID: {sender_id}, 图片大小: {len(image_data)} 字节")
-                            
-                            # 发送成功获取第一张图片的提示
-                            success_reply = Reply(ReplyType.TEXT, "成功获取第一张图片，请发送第二张图片")
-                            e_context["reply"] = success_reply
-                            e_context.action = EventAction.BREAK_PASS
-                            return
+                                # 这是成功的API响应
+                                logger.info(f"识图成功，结果长度: {len(analysis_result)}")
+                                self.last_analysis_image[sender_id] = image_data
+                                self.last_analysis_time[sender_id] = time.time()
+                                analysis_result += "\n💬3min内输入g追问+问题，可继续追问"
+                                reply = Reply(ReplyType.TEXT, analysis_result)
                         else:
-                            # 已有第一张图片，这是第二张图片
-                            first_image_base64 = self.merge_first_image[sender_id]
-                            prompt = self.waiting_for_merge_image[sender_id]
-                            logger.info(f"接收到融图第二张图片，用户ID: {sender_id}, 图片大小: {len(image_data)} 字节，提示词: {prompt}")
-                            
-                            # 清除等待状态
-                            del self.waiting_for_merge_image[sender_id]
-                            del self.waiting_for_merge_image_time[sender_id]
+                            # API调用本身返回None（可能是网络错误或其他未被完整性检查捕获的问题）
+                            logger.error("识图失败，_analyze_image返回为空 (可能为API调用问题或未预料的内部错误)")
+                            reply = Reply(ReplyType.TEXT, "图片分析失败，请稍后重试。")
+                        
+                        # 清理状态
+                        del self.waiting_for_analysis_image[sender_id]
+                        del self.waiting_for_analysis_image_time[sender_id]
+                        
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                    except Exception as e:
+                        logger.error(f"处理识图请求异常: {str(e)}")
+                        logger.exception(e)
+                        
+                        # 清理状态
+                        del self.waiting_for_analysis_image[sender_id]
+                        del self.waiting_for_analysis_image_time[sender_id]
+                        
+                        reply = Reply(ReplyType.TEXT, f"图片分析失败: {str(e)}")
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                # 检查是否有用户在等待上传融图图片
+                elif sender_id and sender_id in self.waiting_for_merge_image:
+                    # 检查是否超时
+                    if time.time() - self.waiting_for_merge_image_time[sender_id] > self.merge_image_wait_timeout:
+                        # 清理状态
+                        del self.waiting_for_merge_image[sender_id]
+                        del self.waiting_for_merge_image_time[sender_id]
+                        if sender_id in self.merge_first_image:
                             del self.merge_first_image[sender_id]
-                            
-                            # 删除成功获取图片的提示消息，直接进行处理
-                            # 设置事件状态，但不发送消息
-                            e_context.action = EventAction.BREAK_PASS
-                            
-                            # 处理融图
-                            self._handle_merge_images(e_context, sender_id, prompt, first_image_base64, image_base64)
-                            return
+                        
+                        reply = Reply(ReplyType.TEXT, "图片上传超时，请重新发送融图命令")
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                    
+                    # 将图片转换为base64
+                    image_base64 = base64.b64encode(image_data).decode('utf-8')
+                    
+                    # 检查是否是第一张图片
+                    if sender_id not in self.merge_first_image:
+                        # 保存第一张图片
+                        self.merge_first_image[sender_id] = image_base64
+                        logger.info(f"接收到融图第一张图片，用户ID: {sender_id}, 图片大小: {len(image_data)} 字节")
+                        
+                        # 发送成功获取第一张图片的提示
+                        success_reply = Reply(ReplyType.TEXT, "成功获取第一张图片，请发送第二张图片")
+                        e_context["reply"] = success_reply
+                        e_context.action = EventAction.BREAK_PASS
+                        return
                     else:
-                        logger.info(f"已缓存图片，但用户 {sender_id} 没有等待中的图片操作")
-                except Exception as img_err:
-                    logger.error(f"图片验证失败: {str(img_err)}")
-                    logger.exception(img_err)
-                    reply = Reply(ReplyType.TEXT, "无法处理图片，请确保上传的是有效的图片文件。")
-                    e_context["reply"] = reply
-                    e_context.action = EventAction.BREAK_PASS
-                    return
-            else:
-                logger.error(f"无法获取有效的图片数据，图片路径: {image_path}")
-                reply = Reply(ReplyType.TEXT, "无法获取图片数据，请重新上传图片或尝试其他格式。")
+                        # 已有第一张图片，这是第二张图片
+                        first_image_base64 = self.merge_first_image[sender_id]
+                        prompt = self.waiting_for_merge_image[sender_id]
+                        logger.info(f"接收到融图第二张图片，用户ID: {sender_id}, 图片大小: {len(image_data)} 字节，提示词: {prompt}")
+                        
+                        # 清除等待状态
+                        del self.waiting_for_merge_image[sender_id]
+                        del self.waiting_for_merge_image_time[sender_id]
+                        del self.merge_first_image[sender_id]
+                        
+                        # 删除成功获取图片的提示消息，直接进行处理
+                        # 设置事件状态，但不发送消息
+                        e_context.action = EventAction.BREAK_PASS
+                        
+                        # 处理融图
+                        self._handle_merge_images(e_context, sender_id, prompt, first_image_base64, image_base64)
+                        return
+                else:
+                    logger.info(f"已缓存图片，但用户 {sender_id} 没有等待中的图片操作")
+            except Exception as img_err:
+                logger.error(f"图片验证失败: {str(img_err)}")
+                logger.exception(img_err)
+                reply = Reply(ReplyType.TEXT, "无法处理图片，请确保上传的是有效的图片文件。")
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
                 return
-                
+        else:
+            logger.error(f"无法获取有效的图片数据。原始content: {str(image_path_or_xml_content)[:200]}...")
+            reply = Reply(ReplyType.TEXT, "无法获取图片数据，请重新上传图片或尝试其他格式。")
+            e_context["reply"] = reply
+            e_context.action = EventAction.BREAK_PASS
+            return
+
     def _get_recent_image(self, conversation_key: str) -> Optional[bytes]:
         """获取最近的图片数据，支持群聊和单聊场景
         
@@ -1820,7 +2048,7 @@ class GeminiImage(Plugin):
                 try:
                     result = response.json()
                     # 记录解析后的JSON结构
-                    logger.debug(f"Gemini API响应JSON结构: {result}")
+                    logger.debug(f"Gemini API响应JSON结构: {self._safe_api_response_for_logging(result)}")
                 except json.JSONDecodeError as json_err:
                     logger.error(f"JSON解析错误: {str(json_err)}, 响应内容: {response_text[:200]}")
                     # 检查是否是代理服务问题
@@ -1897,6 +2125,10 @@ class GeminiImage(Plugin):
     
     def _edit_image(self, prompt: str, image_data: bytes, conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
         """调用Gemini API编辑图片，返回图片数据和文本响应"""
+        # Add integrity check here
+        if not self._verify_image_integrity(image_data, "图片编辑"):
+            return None, "用于编辑的图片文件似乎已损坏或格式不受支持。"
+
         # 根据配置决定使用直接调用还是通过代理服务调用
         if self.use_proxy_service and self.proxy_service_url:
             # 使用代理服务调用API
@@ -2346,185 +2578,54 @@ class GeminiImage(Plugin):
                 "translate_off_commands": ["g关闭翻译", "g禁用翻译"]
             }
 
-    def _get_image_data(self, msg, image_path_or_data):
+    def _get_image_data(self, msg_obj, image_path_from_context: str) -> Optional[bytes]:
         """
-        统一的图片数据获取方法，参考QwenVision插件的实现
-        
-        Args:
-            msg: 消息对象，可能包含图片数据或路径
-            image_path_or_data: 可能是图片路径、URL或二进制数据
-            
-        Returns:
-            bytes: 图片二进制数据，获取失败则返回None
+        获取图片数据。
+        此函数现在假定图片下载（如果需要）已由底层通道 (wx849_channel) 处理，
+        并且 image_path_from_context 应该是一个指向本地缓存文件的有效路径。
+        如果 image_path_from_context 不是有效路径，则表明底层获取失败。
+        参数 'msg_obj' 保留用于签名兼容性或未来可能的元数据提取，但不再用于下载。
         """
-        try:
-            # 如果已经是二进制数据，直接返回
-            if isinstance(image_path_or_data, bytes):
-                logger.debug(f"处理二进制数据，大小: {len(image_path_or_data)} 字节")
-                return image_path_or_data
-            
-            logger.debug(f"开始处理图片，类型: {type(image_path_or_data)}")
-            
-            # 统一的文件读取函数
-            def read_file(file_path):
-                try:
-                    with open(file_path, 'rb') as f:
-                        data = f.read()
-                        logger.debug(f"成功读取文件: {file_path}, 大小: {len(data)} 字节")
-                        return data
-                except Exception as e:
-                    logger.error(f"读取文件失败 {file_path}: {e}")
+        logger.debug(f"调用 _get_image_data, image_path_from_context 类型: {type(image_path_from_context)}, 内容 (前100): {str(image_path_from_context)[:100]}")
+
+        if isinstance(image_path_from_context, str) and os.path.exists(image_path_from_context):
+            # 检查是否真的是文件路径，而不是看起来像路径的XML字符串
+            # A simple check: XML usually starts with '<', while paths usually don't in this context.
+            # And paths should not contain typical XML tags.
+            if image_path_from_context.strip().startswith("<") and ">" in image_path_from_context:
+                logger.warning(f"提供的路径 '{image_path_from_context}' 看起来像XML，而不是有效的文件路径。")
+                return None
+
+            logger.info(f"尝试从有效文件路径读取图片数据: {image_path_from_context}")
+            try:
+                with open(image_path_from_context, "rb") as f:
+                    image_data = f.read()
+                if not image_data:
+                    logger.warning(f"图片文件为空: {image_path_from_context}")
                     return None
-            
-            # 按优先级尝试不同的读取方式
-            # 1. 如果是文件路径，直接读取
-            if isinstance(image_path_or_data, str):
-                if os.path.isfile(image_path_or_data):
-                    data = read_file(image_path_or_data)
-                    if data:
-                        return data
-                
-                # 2. 处理URL，尝试下载
-                if image_path_or_data.startswith(('http://', 'https://')):
-                    try:
-                        logger.debug(f"尝试从URL下载图片: {image_path_or_data}")
-                        response = requests.get(image_path_or_data, timeout=10)
-                        if response.status_code == 200:
-                            data = response.content
-                            if data and len(data) > 1000:
-                                logger.debug(f"从URL下载图片成功，大小: {len(data)} 字节")
-                                return data
-                    except Exception as e:
-                        logger.error(f"从URL下载图片失败: {e}")
-                
-                # 3. 尝试不同的路径组合
-                if image_path_or_data.startswith('tmp/') and not os.path.exists(image_path_or_data):
-                    # 尝试使用项目目录
-                    project_path = os.path.join(os.path.dirname(__file__), image_path_or_data)
-                    if os.path.exists(project_path):
-                        data = read_file(project_path)
-                        if data:
-                            return data
-                    
-                    # 尝试使用临时目录
-                    temp_path = os.path.join("temp", os.path.basename(image_path_or_data))
-                    if os.path.exists(temp_path):
-                        data = read_file(temp_path)
-                        if data:
-                            return data
-            
-            # 4. 从msg对象获取图片数据
-            if msg:
-                # 4.1 检查file_path属性
-                if hasattr(msg, 'file_path') and msg.file_path:
-                    file_path = msg.file_path
-                    logger.debug(f"从msg.file_path获取到文件路径: {file_path}")
-                    data = read_file(file_path)
-                    if data:
-                        return data
-                
-                # 4.2 检查msg.content
-                if hasattr(msg, 'content'):
-                    if isinstance(msg.content, bytes):
-                        logger.debug(f"使用msg.content中的二进制内容，大小: {len(msg.content)} 字节")
-                        return msg.content
-                    elif isinstance(msg.content, str) and os.path.isfile(msg.content):
-                        data = read_file(msg.content)
-                        if data:
-                            return data
-                
-                # 4.3 尝试使用download_image方法
-                if hasattr(msg, 'download_image') and callable(getattr(msg, 'download_image')):
-                    try:
-                        logger.debug("尝试使用msg.download_image()方法获取图片")
-                        image_data = msg.download_image()
-                        if image_data and len(image_data) > 1000:
-                            logger.debug(f"通过download_image方法获取到图片数据，大小: {len(image_data)} 字节")
-                            return image_data
-                    except Exception as e:
-                        logger.error(f"download_image方法调用失败: {e}")
-                
-                # 4.4 尝试从msg.img获取
-                if hasattr(msg, 'img') and msg.img:
-                    image_data = msg.img
-                    if image_data and len(image_data) > 1000:
-                        logger.debug(f"从msg.img获取到图片数据，大小: {len(image_data)} 字节")
-                        return image_data
-                
-                # 4.5 尝试从msg.msg_data获取
-                if hasattr(msg, 'msg_data'):
-                    try:
-                        msg_data = msg.msg_data
-                        if isinstance(msg_data, dict) and 'image' in msg_data:
-                            image_data = msg_data['image']
-                            if image_data and len(image_data) > 1000:
-                                logger.debug(f"从msg_data['image']获取到图片数据，大小: {len(image_data)} 字节")
-                                return image_data
-                        elif isinstance(msg_data, bytes):
-                            image_data = msg_data
-                            logger.debug(f"从msg_data(bytes)获取到图片数据，大小: {len(image_data)} 字节")
-                            return image_data
-                    except Exception as e:
-                        logger.error(f"获取msg_data失败: {e}")
-                
-                # 4.6 微信特殊处理：尝试从_rawmsg获取图片路径
-                if hasattr(msg, '_rawmsg') and isinstance(msg._rawmsg, dict):
-                    try:
-                        rawmsg = msg._rawmsg
-                        logger.debug(f"获取到_rawmsg: {type(rawmsg)}")
-                        
-                        # 检查是否有图片文件路径
-                        if 'file' in rawmsg and rawmsg['file']:
-                            file_path = rawmsg['file']
-                            logger.debug(f"从_rawmsg获取到文件路径: {file_path}")
-                            data = read_file(file_path)
-                            if data:
-                                return data
-                    except Exception as e:
-                        logger.error(f"处理_rawmsg失败: {e}")
-                
-                # 4.7 尝试从image_url属性获取
-                if hasattr(msg, 'image_url') and msg.image_url:
-                    try:
-                        image_url = msg.image_url
-                        logger.debug(f"从msg.image_url获取图片URL: {image_url}")
-                        response = requests.get(image_url, timeout=10)
-                        if response.status_code == 200:
-                            data = response.content
-                            if data and len(data) > 1000:
-                                logger.debug(f"从image_url下载图片成功，大小: {len(data)} 字节")
-                                return data
-                    except Exception as e:
-                        logger.error(f"从image_url下载图片失败: {e}")
-                
-                # 4.8 如果文件未下载，尝试下载 (类似QwenVision的_prepare_fn处理)
-                if hasattr(msg, '_prepare_fn') and hasattr(msg, '_prepared') and not msg._prepared:
-                    logger.debug("尝试调用msg._prepare_fn()下载图片...")
-                    try:
-                        msg._prepare_fn()
-                        msg._prepared = True
-                        time.sleep(1)  # 等待文件准备完成
-                        
-                        # 再次尝试获取内容
-                        if hasattr(msg, 'content'):
-                            if isinstance(msg.content, bytes):
-                                return msg.content
-                            elif isinstance(msg.content, str) and os.path.isfile(msg.content):
-                                data = read_file(msg.content)
-                                if data:
-                                    return data
-                    except Exception as e:
-                        logger.error(f"调用_prepare_fn下载图片失败: {e}")
-            
-            logger.error(f"无法获取图片数据: {image_path_or_data}")
-            return None
-            
-        except Exception as e:
-            logger.error(f"获取图片数据失败: {e}")
+                logger.info(f"成功从文件读取图片数据，大小: {len(image_data)} bytes from: {image_path_from_context}")
+                return image_data
+            except Exception as e:
+                logger.error(f"读取图片文件失败: {image_path_from_context}, Error: {e}")
+                logger.exception(e)
+                return None
+        else:
+            path_info = image_path_from_context if isinstance(image_path_from_context, str) else "Non-string content"
+            logger.warning(
+                f"提供的 content 不是一个有效的文件路径或文件不存在: '{path_info[:200]}' "
+                f"(类型: {type(image_path_from_context)}). 这通常意味着底层通道未能成功下载或提供图片。"
+            )
+            # Log msg_obj details if it might be relevant for debugging why channel failed
+            if msg_obj and hasattr(msg_obj, 'msg_id'):
+                 logger.debug(f"Relevant msg_id from msg_obj: {msg_obj.msg_id}")
             return None
 
     def _reverse_image(self, image_data: bytes) -> Optional[str]:
         """调用Gemini API分析图片内容"""
+        # Add integrity check here
+        if not self._verify_image_integrity(image_data, "反推提示词"):
+            return "图片文件似乎已损坏或格式不受支持，无法进行反推。"
+
         try:
             # 将图片转换为Base64格式
             image_base64 = base64.b64encode(image_data).decode("utf-8")
@@ -2550,14 +2651,14 @@ class GeminiImage(Plugin):
             
             # 根据配置决定使用直接调用还是通过代理服务调用
             if self.use_proxy_service and self.proxy_service_url:
-                url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.image_model}:generateContent"
+                url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.analysis_model}:generateContent"
                 headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
                 }
                 params = {}
             else:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.image_model}:generateContent"
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.analysis_model}:generateContent"
                 headers = {
                     "Content-Type": "application/json",
                 }
@@ -2614,6 +2715,10 @@ class GeminiImage(Plugin):
         Returns:
             str: 分析结果或问题的回答
         """
+        # Add integrity check here
+        if not self._verify_image_integrity(image_data, "识图"):
+            return "图片文件似乎已损坏或格式不受支持，无法进行分析。"
+
         try:
             # 将图片数据转换为base64格式
             image_base64 = base64.b64encode(image_data).decode('utf-8')
@@ -2644,14 +2749,14 @@ class GeminiImage(Plugin):
             
             # 根据配置决定使用直接调用还是通过代理服务调用
             if self.use_proxy_service and self.proxy_service_url:
-                url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.image_model}:generateContent"
+                url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.analysis_model}:generateContent"
                 headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
                 }
                 params = {}
             else:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.image_model}:generateContent"
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.analysis_model}:generateContent"
                 headers = {
                     "Content-Type": "application/json",
                 }
@@ -2728,21 +2833,17 @@ class GeminiImage(Plugin):
             try:
                 # 将base64转换为二进制数据
                 image_data = base64.b64decode(image_base64)
-                logger.info(f"成功解码图片数据，大小: {len(image_data)} 字节")
-                
-                # 验证图片数据是否有效
-                try:
-                    Image.open(BytesIO(image_data))
-                    logger.info("图片数据验证成功")
-                except Exception as img_err:
-                    logger.error(f"图片数据无效: {str(img_err)}")
-                    reply = Reply(ReplyType.TEXT, "无法处理图片，请确保上传的是有效的图片文件。")
-                    e_context["reply"] = reply
-                    e_context.action = EventAction.BREAK_PASS
-                    return
+                logger.info(f"成功解码参考图Base64数据，大小: {len(image_data)} 字节")
             except Exception as decode_err:
-                logger.error(f"Base64解码失败: {str(decode_err)}")
-                reply = Reply(ReplyType.TEXT, "图片数据解码失败，请重新上传图片。")
+                logger.error(f"参考图Base64解码失败: {str(decode_err)}")
+                reply = Reply(ReplyType.TEXT, "参考图片数据解码失败，请重新上传图片。")
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
+
+            # Verify image integrity
+            if not self._verify_image_integrity(image_data, "参考图编辑", "uploaded_reference_image"):
+                reply = Reply(ReplyType.TEXT, "上传的参考图片文件似乎已损坏或格式不受支持。")
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
                 return
@@ -2903,16 +3004,40 @@ class GeminiImage(Plugin):
             # 确保会话存在并设置为融图模式
             conversation_key = user_id
             self._create_or_reset_conversation(conversation_key, self.SESSION_TYPE_MERGE, False)
+
+            try:
+                first_image_data = base64.b64decode(first_image_base64)
+                logger.info(f"成功解码融图第一张图片Base64数据，大小: {len(first_image_data)} 字节")
+            except Exception as decode_err:
+                logger.error(f"融图第一张图片Base64解码失败: {str(decode_err)}")
+                error_reply = Reply(ReplyType.TEXT, "融图第一张图片数据解码失败，请重新操作。")
+                channel.send(error_reply, context)
+                return
+
+            if not self._verify_image_integrity(first_image_data, "融图-第一张图片", "first_image"):
+                error_reply = Reply(ReplyType.TEXT, "融图的第一张图片文件似乎已损坏或格式不受支持。")
+                channel.send(error_reply, context)
+                return
+
+            try:
+                second_image_data = base64.b64decode(second_image_base64)
+                logger.info(f"成功解码融图第二张图片Base64数据，大小: {len(second_image_data)} 字节")
+            except Exception as decode_err:
+                logger.error(f"融图第二张图片Base64解码失败: {str(decode_err)}")
+                error_reply = Reply(ReplyType.TEXT, "融图第二张图片数据解码失败，请重新操作。")
+                channel.send(error_reply, context)
+                return
+
+            if not self._verify_image_integrity(second_image_data, "融图-第二张图片", "second_image"):
+                error_reply = Reply(ReplyType.TEXT, "融图的第二张图片文件似乎已损坏或格式不受支持。")
+                channel.send(error_reply, context)
+                return
             
             # 增强提示词，明确要求生成图片
             enhanced_prompt = f"{prompt}。请生成一张融合两张输入图片的新图片，确保在回复中包含图片。"
             
             # 压缩图片以减小请求体大小
             try:
-                # 将base64字符串转换回图像数据
-                first_image_data = base64.b64decode(first_image_base64)
-                second_image_data = base64.b64decode(second_image_base64)
-                
                 # 获取原始大小用于日志
                 first_size = len(first_image_data)
                 second_size = len(second_image_data)
